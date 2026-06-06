@@ -1,0 +1,19 @@
+{
+  "clip_hotkey": "alt+f10",
+  "record_hotkey": "alt+f9",
+  "clip_duration": 15,
+  "video_fps": 15,
+  "audio_sample_rate": 44100,
+  "video_bitrate": 3000000,
+  "output_directory": "C:/pywork/new testing land/ZZZZZZZZZZZZZZZZZ/pyplay/v2/clips",
+  "force_show_notification": true,
+  "enabled_streams": [
+    true,
+    false,
+    true
+  ],
+  "clipping_enabled": false,
+  "chosen_mic": "Microphone (High Definition Audio Device)",
+  "record_mouse": true,
+  "video_resolution": "720"
+}
