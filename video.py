@@ -389,18 +389,13 @@ class VID_record:
             if self.target_res != 'Screen':
                 target_width, target_height = calculate_scaled_resolution(current_width, current_height, target_height=int(self.target_res))
 
-            # Initialize the reformatter if it hasn't been set, or if the target resolution or format changes
-            # This ensures the reformatter is configured correctly for the current frame's source and target.
+            # One-time setup, now that we know the real captured frame size.
             if self.reformatter is None:
-                self.reformatter = av.video.reformatter.VideoReformatter(
-                    width=current_width,
-                    height=current_height,
-                    format='bgr24',  # Input format from bettercam/FFmpegshot
-                    dst_width=target_width,
-                    dst_height=target_height,
-                    dst_format=self.codec.pix_fmt,
-                    interpolation='SWS_LANCZOS'
-                )
+                self.reformatter = av.video.reformatter.VideoReformatter()
+                # Only resize when the target actually differs from the source.
+                # At 'Screen' res we skip the reformatter and let the encoder do
+                # the bgr24 -> yuv420p colour conversion at the same size.
+                self._needs_resize = (target_width, target_height) != (current_width, current_height)
                 # Update codec context dimensions once for the output stream
                 self.codec.width = target_width
                 self.codec.height = target_height
@@ -410,9 +405,20 @@ class VID_record:
             # Convert numpy array to PyAV frame
             frame = av.VideoFrame.from_ndarray(screenshot, format='bgr24')
 
-            # Use the reformatter to resize and reformat the frame
-            # The reformatter handles both resizing and pixel format conversion
-            frame = self.reformatter.reformat(frame)
+            # Real, high-quality Lanczos downscale. The previous reformatter was
+            # constructed with constructor kwargs that PyAV ignores, so reformat()
+            # was a silent no-op and downscaled clips fell back to the encoder's
+            # default *bilinear* (blurry). Doing the Lanczos resize here costs
+            # about the same CPU as the encoder's internal resize, because nvenc
+            # then encodes a smaller frame.
+            if self._needs_resize:
+                frame = self.reformatter.reformat(
+                    frame,
+                    width=self.codec.width,
+                    height=self.codec.height,
+                    format=self.codec.pix_fmt,
+                    interpolation=av.video.reformatter.Interpolation.LANCZOS,
+                )
 
             frame.pts = self.frame_idx
             packets = self.codec.encode(frame)  # list of Packet objects
