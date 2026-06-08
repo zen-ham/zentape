@@ -291,6 +291,10 @@ class VID_record:
 
         self.frame_q = queue.Queue(maxsize=60)
 
+        # Signalled by the encode worker every time a frame lands in the buffer,
+        # so clip() can wait efficiently instead of busy-spinning.
+        self._buffer_cond = threading.Condition()
+
         threading.Thread(target=self._encording_worker, daemon=True).start()
 
     def _record_loop(self):
@@ -412,6 +416,10 @@ class VID_record:
                 while time.time() - self.frames_buffer[0][1] > self.clip_duration:
                     self.frames_buffer.pop(0)
 
+            # Wake any clip() waiting for the buffer to reach its requested time.
+            with self._buffer_cond:
+                self._buffer_cond.notify_all()
+
             self.frame_q.task_done()
 
             self.encoding_pts += 1
@@ -493,10 +501,20 @@ class VID_record:
 
     def clip(self, args=None):
         clip_time = time.time()
+        deadline = clip_time + 5.0  # safety timeout so a stalled pipeline can't hang clip()
 
-        while self.frames_buffer[-1][1] < clip_time:
-            time.sleep(1/60)
-        return self.frames_buffer
+        with self._buffer_cond:
+            while True:
+                buf = self.frames_buffer
+                if buf and buf[-1][1] >= clip_time:
+                    break
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    break
+                self._buffer_cond.wait(timeout=remaining)
+            # Return a snapshot of the references so the buffer can keep mutating
+            # underneath us while the clip is being assembled.
+            return list(self.frames_buffer)
 
     def write_file(self, frames, filename):
         if not frames:
