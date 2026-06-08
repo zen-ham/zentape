@@ -300,6 +300,7 @@ class VID_record:
     def _record_loop(self):
         self.recording_pts = 0
         self.encoding_pts = 0
+        self.dropped_frames = 0
         if self.record_ffmpeg:
             with FFmpegshot() as sc:
                 for screenshot in sc.capture_one_screen_ddagrab(
@@ -347,9 +348,14 @@ class VID_record:
                 else:
                     info = None
 
-                self.frame_q.put((screenshot, time.time(), info))
-
-                self.recording_pts += 1
+                try:
+                    # Non-blocking: if the encoder is behind, drop this frame
+                    # rather than stalling capture. With wall-clock VFR PTS the
+                    # gap is preserved as a held frame, so timing stays honest.
+                    self.frame_q.put_nowait((screenshot, time.time(), info))
+                    self.recording_pts += 1
+                except queue.Full:
+                    self.dropped_frames += 1
 
             print('stopping bc')
             bc.stop()
