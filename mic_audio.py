@@ -22,6 +22,9 @@ class MIC_record: # Renamed the class for clarity
         self.name = 'microphone_audio'
         self.ext = '.wav'
 
+        # Name of the mic the user picked in the GUI. None => use system default.
+        self.selected_mic_name = None
+
 
     def get_microphone_device(self): # Renamed and simplified
         """
@@ -29,6 +32,7 @@ class MIC_record: # Renamed the class for clarity
         the default input device, or the first available microphone.
         """
         import soundcard as sc
+        default = None
         try:
             default = sc.default_microphone()
             print(f"Using default microphone: {default.name} (ID: {default.id})")
@@ -49,8 +53,24 @@ class MIC_record: # Renamed the class for clarity
             return None
 
 
+    def _resolve_microphone(self):
+        """Resolve the device to actually open: the user-selected mic if one is set
+        and still present, otherwise the system default."""
+        import soundcard as sc
+        name = self.selected_mic_name
+        if name:
+            try:
+                for m in sc.all_microphones():
+                    if m.name == name:
+                        print(f"Using selected microphone: {m.name} (ID: {m.id})")
+                        return m
+                print(f"Selected microphone '{name}' not found; falling back to default.")
+            except Exception as e:
+                print(f"Error resolving selected microphone '{name}': {e}")
+        return self.get_microphone_device()[0]
+
     def continuous_record_buffer(self):
-        microphone = self.get_microphone_device()[0]
+        microphone = self._resolve_microphone()
         if microphone is None:
             print("Failed to initialize microphone capture. Exiting recording thread.")
             self.stop_event.set()

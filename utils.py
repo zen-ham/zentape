@@ -193,6 +193,22 @@ class StreamController:
     def set_mic(self, mic):
         print(f'!set_mic {mic}')
 
+        was_recording = self.buffers_live
+
+        if self.buffers_live:
+            self.stop()
+
+        # `mic` is a device name from list_mics() (or None / the default name).
+        # Store None when it's the default so the recorder just resolves the
+        # system default; store the explicit name otherwise.
+        if mic and mic != self.mic_default:
+            self.mic_recorder.selected_mic_name = mic
+        else:
+            self.mic_recorder.selected_mic_name = None
+
+        if was_recording:
+            self.start()
+
     def list_mics(self):
         print('!list_mics')
         return self.mics
