@@ -72,6 +72,12 @@ gdi32.DeleteObject.restype = wintypes.BOOL
 
 
 # --- Main Logic ---
+# Cache of extracted cursor bitmaps keyed by HCURSOR handle, so the expensive
+# GDI redraw only happens when the cursor shape actually changes.
+# (Trade-off: animated cursors that reuse one handle will show a static frame.)
+_cursor_bitmap_cache = {}
+
+
 def capture_cursor():
     """
     Captures the cursor image, its position, and hotspot.
@@ -94,6 +100,15 @@ def capture_cursor():
         return
 
     h_cursor = ci.hCursor
+    cursor_pos = (ci.ptScreenPos.x, ci.ptScreenPos.y)
+
+    # Bitmap depends only on the cursor handle; position is the only thing that
+    # changes most frames. Reuse the cached extraction when the shape is the same.
+    cached = _cursor_bitmap_cache.get(h_cursor)
+    if cached is not None:
+        rgba_array, hotspot, is_monochrome = cached
+        return rgba_array, cursor_pos, hotspot, is_monochrome
+
     icon_info = ICONINFO()
 
     try:
@@ -102,7 +117,6 @@ def capture_cursor():
 
         is_monochrome = not icon_info.hbmColor
 
-        cursor_pos = (ci.ptScreenPos.x, ci.ptScreenPos.y)
         hotspot = (icon_info.xHotspot, icon_info.yHotspot)
 
         if is_monochrome:
@@ -151,6 +165,7 @@ def capture_cursor():
 
         # --- CONVERT TO NUMPY ARRAY AND RETURN ---
         rgba_array = np.array(pil_img)
+        _cursor_bitmap_cache[h_cursor] = (rgba_array, hotspot, is_monochrome)
         return rgba_array, cursor_pos, hotspot, is_monochrome
 
     finally:
@@ -333,20 +348,13 @@ class VID_record:
                 if not self._is_recording:
                     break
 
-                if self.record_mouse:
-                    t = ThreadWithReturnValue(target=capture_cursor)
-                    t.start()
-                else:
-                    t = None
-
                 screenshot = bc.get_latest_frame()
                 if screenshot is None:
                     continue
 
-                if self.record_mouse and t is not None:
-                    info = t.join()
-                else:
-                    info = None
+                # Cursor capture is cheap now (bitmap cached by handle), so do it
+                # inline rather than spawning a fresh thread every frame.
+                info = capture_cursor() if self.record_mouse else None
 
                 try:
                     # Non-blocking: if the encoder is behind, drop this frame
