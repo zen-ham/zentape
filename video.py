@@ -467,7 +467,9 @@ class VID_record:
                 'cq': '18',
                 'b:v': f'{self.bitrate}',  # 5 Mbps bitrate
                 'maxrate': f'{self.bitrate * 2}',
-                'bufsize': f'{self.bitrate * 4}'
+                'bufsize': f'{self.bitrate * 4}',
+                'bf': '0'  # no B-frames: keeps decode order == display order and
+                           # pts == dts, so the encoder's wall-clock PTS rebasing is exact
             }
         else:
             # CPU encoder options for speed
