@@ -478,6 +478,12 @@ class VID_record:
 
         self.codec.pix_fmt = 'yuv420p'
         self.codec.time_base = Fraction(1, self.fps)
+        # ~1 second keyframe interval. NVENC's default GOP is huge, which left
+        # only a keyframe or two in the whole replay buffer, so a clip could only
+        # start at one of those sparse points (giving the wrong duration). With
+        # ~1s keyframes the clip starts within a second of the requested point,
+        # and the encoder's head re-encode nails the exact start.
+        self.codec.gop_size = max(1, int(round(self.fps)))
 
         if 'nvenc' in use_enc:
             # NVENC options for speed
