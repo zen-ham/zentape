@@ -2,6 +2,7 @@ import cv2
 import time
 #from ffmpeg_screenshot_pipe import FFmpegshot
 import threading
+import os
 import av
 from fractions import Fraction
 import queue
@@ -304,13 +305,27 @@ class VID_record:
 
         self.bitrate = 5000000
 
-        self.frame_q = queue.Queue(maxsize=60)
+        # Parallel preprocessing (cursor composite + colour convert + Lanczos
+        # resize) is the CPU-heavy, single-threaded bottleneck, so fan it out
+        # across a pool while keeping the encode step ordered and serial. Default
+        # leaves plenty of cores free for whatever is being recorded.
+        self.num_preprocess_workers = max(2, min(6, (os.cpu_count() or 8) - 8))
+
+        self.frame_q = queue.Queue(maxsize=max(8, self.num_preprocess_workers * 3))
 
         # Signalled by the encode worker every time a frame lands in the buffer,
         # so clip() can wait efficiently instead of busy-spinning.
         self._buffer_cond = threading.Condition()
 
-        threading.Thread(target=self._encording_worker, daemon=True).start()
+        # Reorder/handoff state between the preprocess pool and the encode
+        # thread (initialised per-session in start()).
+        self._results = {}
+        self._results_cond = threading.Condition()
+        self._capture_seq = 0
+        self._next_encode_seq = 0
+        self._final_seq = None
+        self._preprocess_threads = []
+        self._encode_thread = None
 
     def _record_loop(self):
         self.recording_pts = 0
@@ -357,10 +372,13 @@ class VID_record:
                 info = capture_cursor() if self.record_mouse else None
 
                 try:
-                    # Non-blocking: if the encoder is behind, drop this frame
+                    # Non-blocking: if the pool is saturated, drop this frame
                     # rather than stalling capture. With wall-clock VFR PTS the
                     # gap is preserved as a held frame, so timing stays honest.
-                    self.frame_q.put_nowait((screenshot, time.time(), info))
+                    # The seq only advances on a successful enqueue, so the
+                    # sequence the encode thread consumes has no gaps.
+                    self.frame_q.put_nowait((self._capture_seq, screenshot, time.time(), info))
+                    self._capture_seq += 1
                     self.recording_pts += 1
                 except queue.Full:
                     self.dropped_frames += 1
@@ -369,65 +387,79 @@ class VID_record:
             bc.stop()
             del bc
 
-    def _encording_worker(self):
-        self.encoding_pts = 0
+    def _preprocess_worker(self):
+        # One of N parallel workers. Does all the CPU-heavy per-frame work and
+        # hands an encode-ready yuv420p frame to the ordered encode thread, keyed
+        # by capture sequence number.
         while True:
-            screenshot, unix_stamp, info = self.frame_q.get()  # blocks until item
+            item = self.frame_q.get()
+            if item is None:  # shutdown sentinel from stop()
+                return
+            seq, screenshot, unix_stamp, info = item
+            result = None
+            try:
+                # Apply DPI-aware cursor compositing *before* resizing.
+                if info:
+                    composite_cursor_dpi_aware(screenshot, info)
 
-            if not self.encode:
-                self.frame_q.task_done()
-                continue
+                current_height, current_width, _ = screenshot.shape
+                target_width, target_height = current_width, current_height
+                if self.target_res != 'Screen':
+                    target_width, target_height = calculate_scaled_resolution(
+                        current_width, current_height, target_height=int(self.target_res))
 
-            # Apply DPI-aware cursor compositing *before* resizing
-            if info:
-                composite_cursor_dpi_aware(screenshot, info)
+                # Resize + colour-convert with OpenCV rather than swscale: cv2
+                # releases the GIL (so the pool actually scales across cores) and
+                # is faster here, while INTER_LANCZOS4 keeps the high-quality
+                # downscale. The encode thread then only feeds the GPU encoder.
+                bgr = screenshot
+                if (target_width, target_height) != (current_width, current_height):
+                    bgr = cv2.resize(bgr, (target_width, target_height), interpolation=cv2.INTER_LANCZOS4)
+                i420 = cv2.cvtColor(bgr, cv2.COLOR_BGR2YUV_I420)  # planar yuv420p layout
+                frame = av.VideoFrame.from_ndarray(i420, format='yuv420p')
+                result = (frame, unix_stamp)
+            except Exception as e:
+                print(f'preprocess error (seq {seq}): {e}')
+                result = None
 
-            # Determine the target resolution for the encoding process
-            current_height, current_width, channels = screenshot.shape
-            target_width, target_height = current_width, current_height
+            with self._results_cond:
+                self._results[seq] = result
+                self._results_cond.notify_all()
 
-            if self.target_res != 'Screen':
-                target_width, target_height = calculate_scaled_resolution(current_width, current_height, target_height=int(self.target_res))
+    def _encode_worker(self):
+        # Single ordered consumer: pulls preprocessed frames strictly in capture
+        # order, runs the stateful encoder, and appends to the time-ordered ring
+        # buffer. Keeping this serial is required for both the encoder state and
+        # the buffer ordering that clip extraction relies on.
+        self.encoding_pts = 0
+        codec_dims_set = False
+        while True:
+            with self._results_cond:
+                while self._next_encode_seq not in self._results:
+                    if self._final_seq is not None and self._next_encode_seq >= self._final_seq:
+                        return  # drained on stop()
+                    self._results_cond.wait(timeout=0.5)
+                result = self._results.pop(self._next_encode_seq)
+                self._next_encode_seq += 1
 
-            # One-time setup, now that we know the real captured frame size.
-            if self.reformatter is None:
-                self.reformatter = av.video.reformatter.VideoReformatter()
-                # Only resize when the target actually differs from the source.
-                # At 'Screen' res we skip the reformatter and let the encoder do
-                # the bgr24 -> yuv420p colour conversion at the same size.
-                self._needs_resize = (target_width, target_height) != (current_width, current_height)
-                # Update codec context dimensions once for the output stream
-                self.codec.width = target_width
-                self.codec.height = target_height
-                self.width = target_width
-                self.height = target_height
+            if result is None:
+                continue  # frame failed in preprocessing; skip it without a gap
 
-            # Convert numpy array to PyAV frame
-            frame = av.VideoFrame.from_ndarray(screenshot, format='bgr24')
+            frame, unix_stamp = result
 
-            # Real, high-quality Lanczos downscale. The previous reformatter was
-            # constructed with constructor kwargs that PyAV ignores, so reformat()
-            # was a silent no-op and downscaled clips fell back to the encoder's
-            # default *bilinear* (blurry). Doing the Lanczos resize here costs
-            # about the same CPU as the encoder's internal resize, because nvenc
-            # then encodes a smaller frame.
-            if self._needs_resize:
-                frame = self.reformatter.reformat(
-                    frame,
-                    width=self.codec.width,
-                    height=self.codec.height,
-                    format=self.codec.pix_fmt,
-                    interpolation=av.video.reformatter.Interpolation.LANCZOS,
-                )
+            # The frame is already at the target size; configure the codec once
+            # before the first encode of this session.
+            if not codec_dims_set:
+                self.codec.width = frame.width
+                self.codec.height = frame.height
+                self.width, self.height = frame.width, frame.height
+                codec_dims_set = True
 
             frame.pts = self.frame_idx
             packets = self.codec.encode(frame)  # list of Packet objects
             self.frame_idx += 1
 
-            keyframe = False
-            for pkt in packets:
-                if pkt.is_keyframe:
-                    keyframe = True
+            keyframe = any(pkt.is_keyframe for pkt in packets)
 
             self.frames_buffer.append((packets, unix_stamp, self.codec, keyframe))
 
@@ -439,8 +471,6 @@ class VID_record:
             # Wake any clip() waiting for the buffer to reach its requested time.
             with self._buffer_cond:
                 self._buffer_cond.notify_all()
-
-            self.frame_q.task_done()
 
             self.encoding_pts += 1
 
@@ -463,7 +493,6 @@ class VID_record:
         use_enc = None
 
         self.height, self.width, self.codec = None, None, None
-        self.reformatter = None  # Ensure reformatter is reset on start
 
         self.frame_idx = 0
 
@@ -506,12 +535,30 @@ class VID_record:
                 'threads': '0'  # Use all available threads
             }
 
+        # Reset the pipeline handoff state for this session.
+        self._results = {}
+        self._results_cond = threading.Condition()
+        self._capture_seq = 0
+        self._next_encode_seq = 0
+        self._final_seq = None
+
         self._is_recording = True
         self.frames_buffer = []
+
+        # Spawn the ordered encode thread + parallel preprocess pool, then the
+        # capture thread.
+        self._encode_thread = threading.Thread(target=self._encode_worker, daemon=True)
+        self._encode_thread.start()
+        self._preprocess_threads = [
+            threading.Thread(target=self._preprocess_worker, daemon=True)
+            for _ in range(self.num_preprocess_workers)
+        ]
+        for t in self._preprocess_threads:
+            t.start()
+
         self._recording_thread = threading.Thread(target=self._record_loop, daemon=True)
-        self._recording_thread.daemon = True
         self._recording_thread.start()
-        print("Screen recording started.")
+        print(f"Screen recording started ({self.num_preprocess_workers} preprocess workers).")
 
     def stop(self):
         if not self._is_recording:
@@ -522,6 +569,21 @@ class VID_record:
         self._is_recording = False
         if self._recording_thread and self._recording_thread.is_alive():
             self._recording_thread.join()
+
+        # Capture has stopped; drain the preprocess pool with one sentinel each,
+        # then let the encode thread finish everything already captured.
+        for _ in self._preprocess_threads:
+            self.frame_q.put(None)
+        for t in self._preprocess_threads:
+            t.join()
+        self._preprocess_threads = []
+
+        with self._results_cond:
+            self._final_seq = self._capture_seq  # every captured frame now has a result
+            self._results_cond.notify_all()
+        if self._encode_thread:
+            self._encode_thread.join()
+            self._encode_thread = None
 
         self.reset_buffer()
 
