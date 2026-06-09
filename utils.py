@@ -371,18 +371,22 @@ class StreamController:
 
         #self.wait_clip_timeout()
 
-        lct = time.time()
+        now = time.time()
 
-        clipped_from = max(self.last_clip_time, time.time()-self.clip_duration)
+        clipped_from = max(self.last_clip_time, now - self.clip_duration)
 
         streams = self.get_stream_data(clipped_from)
 
         if not streams:
             return
 
-        self.notification_object(self.notification_stay_ms, f'Clipped last {self.format_seconds(round(time.time() - clipped_from))}', 'INSTANT REPLAY')
+        # Use the single start timestamp for the reported span. Previously this
+        # called time.time() again *after* get_stream_data (which blocks until
+        # the encoder catches up), so the number was inflated by the processing
+        # delay (e.g. showing 17s for a 15s clip).
+        self.notification_object(self.notification_stay_ms, f'Clipped last {self.format_seconds(round(now - clipped_from))}', 'INSTANT REPLAY')
 
-        self.last_clip_time = lct
+        self.last_clip_time = now
 
         self.write_streams(streams)
 
