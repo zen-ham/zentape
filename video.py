@@ -283,6 +283,20 @@ def calculate_scaled_resolution(original_width, original_height, target_height=N
     return new_width, new_height
 
 
+def get_primary_monitor_fps():
+    """Best-effort current refresh rate (Hz) of the primary monitor."""
+    try:
+        import win32api, win32con
+        dm = win32api.EnumDisplaySettings(None, win32con.ENUM_CURRENT_SETTINGS)
+        hz = float(dm.DisplayFrequency)
+        # Windows reports 0 or 1 for "hardware default" / unknown.
+        if hz > 1:
+            return hz
+    except Exception as e:
+        print(f'Could not detect monitor refresh rate: {e}')
+    return 60.0
+
+
 class VID_record:
     def __init__(self):
         self._is_recording = False

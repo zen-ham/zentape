@@ -1,4 +1,4 @@
-from video import VID_record
+from video import VID_record, get_primary_monitor_fps
 from mic_audio import MIC_record
 from sys_audio import SYS_record
 from encoder import encode_streams
@@ -144,8 +144,29 @@ class StreamController:
         for stream in self.streams:
             stream.clip_duration = duration + self._minimum_extra_buffer_duration
 
+    def _resolve_screen_fps(self):
+        """Detect the primary monitor's refresh rate and snap it to the nearest
+        common value, so panels reporting e.g. 59 (really 59.94) become 60,
+        143 -> 144, 164 -> 165, etc."""
+        raw = get_primary_monitor_fps()
+        common = [24, 30, 48, 50, 60, 72, 75, 90, 100, 120, 144, 165, 180, 200, 240, 360]
+        fps = int(round(raw))
+        for c in common:
+            if abs(raw - c) <= 1.5:
+                fps = c
+                break
+        return max(1, fps)
+
     def set_video_fps(self, fps):
         print(f'!set_video_fps {fps}')
+
+        # 'Screen' => follow the monitor's actual refresh rate.
+        if fps == 'Screen':
+            fps = self._resolve_screen_fps()
+            print(f'  Screen selected -> using detected monitor fps: {fps}')
+        else:
+            fps = int(fps)
+
         was_recording = self.buffers_live
 
         if self.buffers_live:

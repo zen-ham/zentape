@@ -608,7 +608,7 @@ class SettingsPage(QWidget):
         fps_label.setFont(FONT_LABEL_DEFAULT)  # Apply font
         fps_layout.addWidget(fps_label)
         self.fps_combo = QComboBox()
-        self.fps_combo.addItems(["15", "30", "60", "120"])
+        self.fps_combo.addItems(["Screen", "15", "30", "60", "75", "90", "100", "120", "144", "165", "180", "240", "360"])
         self.fps_combo.setCurrentText(str(self.settings.get('video_fps', 60)))
         self.fps_combo.currentTextChanged.connect(self.update_fps)
         self.fps_combo.setFont(FONT_COMBOBOX)  # Apply font
@@ -783,8 +783,11 @@ class SettingsPage(QWidget):
         self.settings_changed.emit()
 
     def update_fps(self, text):
-        self.stream_controller.set_video_fps(int(text))
-        self.settings['video_fps'] = int(text)
+        # 'Screen' is passed through as-is; the controller detects the monitor's
+        # refresh rate. Everything else is a concrete integer fps.
+        value = text if text == 'Screen' else int(text)
+        self.stream_controller.set_video_fps(value)
+        self.settings['video_fps'] = value
         self.settings_changed.emit()
 
     def update_sample_rate(self, text):
