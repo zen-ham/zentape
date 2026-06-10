@@ -356,6 +356,11 @@ class StreamController:
                 cutoff_time = iframe_times[-1]
                 cutoff_time -= 1/1000
 
+        # GPU clips keyframe-snap (no head re-encode): drop the sub-keyframe
+        # residual so the encoder just stream-copies from the keyframe.
+        if not getattr(self.vid_recorder, 'supports_precise_clip', True):
+            self.diff = 0
+
         if frame_count < min_frames:
             return False
 

@@ -3,10 +3,18 @@ import time
 #from ffmpeg_screenshot_pipe import FFmpegshot
 import threading
 import os
+import subprocess
 import av
 from fractions import Fraction
 import queue
 import bettercam
+
+# OpenCV defaults to multi-threading each call, which oversubscribes cores when
+# we also run a worker pool (CPU fallback path); our pool is the parallelism.
+try:
+    cv2.setNumThreads(1)
+except Exception:
+    pass
 
 
 import ctypes
@@ -297,6 +305,40 @@ def get_primary_monitor_fps():
     return 60.0
 
 
+def _primary_resolution():
+    """Native pixel resolution of the primary monitor (process is DPI-aware)."""
+    try:
+        u = ctypes.windll.user32
+        return int(u.GetSystemMetrics(0)), int(u.GetSystemMetrics(1))
+    except Exception:
+        return 1920, 1080
+
+
+class _PipeReader:
+    """Read-only, non-seekable file-like wrapper around a subprocess pipe so PyAV
+    treats it as a pure stream and never tries to seek() it (which fails on a
+    pipe with EINVAL)."""
+    def __init__(self, f):
+        self._f = f
+
+    def read(self, n):
+        return self._f.read(n)
+
+
+class _StreamParams:
+    """Duck-typed stand-in for a source codec/stream that encoder.encode_streams
+    reads (name/width/height/pix_fmt/time_base/options). For GPU clips we use the
+    plain codec name 'h264' so add_stream() creates a stream-copy target rather
+    than opening another NVENC encoder session."""
+    def __init__(self, name, width, height, pix_fmt, time_base, options=None):
+        self.name = name
+        self.width = width
+        self.height = height
+        self.pix_fmt = pix_fmt
+        self.time_base = time_base
+        self.options = options or {}
+
+
 class VID_record:
     def __init__(self):
         self._is_recording = False
@@ -340,6 +382,20 @@ class VID_record:
         self._final_seq = None
         self._preprocess_threads = []
         self._encode_thread = None
+
+        # GPU-pipeline (primary path) state. Capture+scale+encode run entirely on
+        # the GPU via an ffmpeg ddagrab->scale_d3d11->h264_nvenc subprocess; we
+        # only demux the resulting packets into the ring buffer (~0% CPU). Falls
+        # back to the bettercam+cv2 path above when the GPU pipeline isn't usable.
+        self._mode = None              # 'gpu' or 'cpu' for the active session
+        self._ffmpeg_proc = None
+        self._gpu_thread = None
+        self._gpu_codec = None         # codec param descriptor used by the clip muxer
+        # CPU path can re-encode the sub-keyframe head for an exact clip start;
+        # the GPU path keyframe-snaps instead (a 2nd/3rd NVENC session for the
+        # head re-encode isn't reliable alongside the capture pipeline, and with
+        # a ~1s GOP the snap is within a second of the requested point).
+        self.supports_precise_clip = True
 
     def _record_loop(self):
         self.recording_pts = 0
@@ -491,11 +547,179 @@ class VID_record:
     def reset_buffer(self):
         self.frames_buffer = []
 
+    # ------------------------------------------------------------------
+    # GPU pipeline (primary): ffmpeg  ddagrab -> scale_d3d11 -> h264_nvenc
+    # -> mpegts pipe -> PyAV demux -> ring buffer. Capture, downscale and
+    # encode all happen on the GPU, so this costs ~0% CPU.
+    # ------------------------------------------------------------------
+    _gpu_capable = None  # class-level cache: None=unknown, then True/False
+
+    @classmethod
+    def _probe_gpu(cls):
+        """Check once whether the GPU capture pipeline works on this machine
+        (Desktop Duplication + D3D11 scaler + NVENC, all via ffmpeg)."""
+        if cls._gpu_capable is not None:
+            return cls._gpu_capable
+        ok = False
+        try:
+            cmd = ['ffmpeg', '-hide_banner', '-loglevel', 'error',
+                   '-f', 'lavfi', '-i', 'ddagrab=framerate=30',
+                   '-vf', 'scale_d3d11=640:360:format=nv12',
+                   '-c:v', 'h264_nvenc', '-frames:v', '3', '-f', 'null', '-']
+            r = subprocess.run(cmd, capture_output=True, timeout=20)
+            ok = (r.returncode == 0)
+        except Exception as e:
+            print(f'GPU capture probe failed: {e}')
+        cls._gpu_capable = ok
+        print(f'GPU capture pipeline {"available" if ok else "unavailable"} '
+              f'-> using {"GPU" if ok else "CPU"} path.')
+        return ok
+
+    def _build_ffmpeg_cmd(self):
+        fps = max(1, int(round(self.fps)))
+        cmd = ['ffmpeg', '-hide_banner', '-loglevel', 'error',
+               '-f', 'lavfi',
+               '-i', (f'ddagrab=framerate={fps}'
+                      f':draw_mouse={1 if self.record_mouse else 0}'
+                      f':output_idx={self.monitor_index}')]
+        if self.target_res != 'Screen':
+            nw, nh = _primary_resolution()
+            tw, th = calculate_scaled_resolution(nw, nh, target_height=int(self.target_res))
+            tw -= tw % 2  # NVENC wants even dimensions
+            th -= th % 2
+            cmd += ['-vf', f'scale_d3d11={tw}:{th}:format=nv12']
+        cmd += ['-c:v', 'h264_nvenc', '-preset', 'p4', '-rc', 'vbr', '-cq', '18',
+                '-b:v', str(self.bitrate), '-maxrate', str(self.bitrate * 2),
+                '-bufsize', str(self.bitrate * 4), '-g', str(fps), '-bf', '0',
+                '-f', 'mpegts', 'pipe:1']
+        return cmd
+
+    def _gpu_reader(self):
+        """Demux the ffmpeg mpegts pipe into the rolling buffer. Each entry is
+        ([packet], wall_stamp, codec_descriptor, keyframe) -- the SAME shape the
+        CPU encode worker produces, so encoder.encode_streams is unchanged."""
+        proc = self._ffmpeg_proc
+        try:
+            container = av.open(_PipeReader(proc.stdout), format='mpegts')
+        except Exception as e:
+            print(f'GPU reader: could not open ffmpeg stream: {e}')
+            return
+        vstream = container.streams.video[0]
+        cc = vstream.codec_context
+
+        # Stream-copy params for the clip muxer. Plain codec name 'h264' (not an
+        # encoder) so add_stream() makes a copy target without opening a second
+        # NVENC session. GPU clips are keyframe-snap (no head re-encode), so the
+        # encoder options aren't needed here.
+        try:
+            pix_fmt = cc.format.name
+        except Exception:
+            pix_fmt = 'yuv420p'
+        desc = _StreamParams('h264', cc.width or self.width, cc.height or self.height,
+                             pix_fmt, Fraction(1, max(1, int(round(self.fps)))))
+        self._gpu_codec = desc
+        self.width, self.height = desc.width, desc.height
+
+        tb = vstream.time_base or Fraction(1, 90000)
+        t0_wall = None
+        pts0 = None
+        try:
+            for packet in container.demux(vstream):
+                if not self._is_recording:
+                    break
+                if packet.pts is None or packet.dts is None or packet.size == 0:
+                    continue
+                # Stamp from ffmpeg's frame PTS (accurately paced by ddagrab),
+                # NOT the pipe arrival time -- PyAV delivers packets in bursts, so
+                # arrival times are clumped and would collapse the clip's PTS.
+                # Anchor to the first frame's wall clock so the stamp still tracks
+                # real time for buffer eviction.
+                if t0_wall is None:
+                    t0_wall = time.time()
+                    pts0 = packet.pts
+                stamp = t0_wall + float((packet.pts - pts0) * tb)
+                kf = bool(packet.is_keyframe)
+                clone = av.Packet(bytes(packet))
+                clone.is_keyframe = kf
+                clone.pts = packet.pts
+                clone.dts = packet.dts
+                clone.time_base = packet.time_base
+                self.frames_buffer.append(([clone], stamp, desc, kf))
+                if self.frames_buffer:
+                    while time.time() - self.frames_buffer[0][1] > self.clip_duration:
+                        self.frames_buffer.pop(0)
+                with self._buffer_cond:
+                    self._buffer_cond.notify_all()
+        except Exception as e:
+            if self._is_recording:
+                print(f'GPU reader stopped: {e}')
+        finally:
+            try:
+                container.close()
+            except Exception:
+                pass
+
+    def _start_gpu(self):
+        self._mode = 'gpu'
+        self.supports_precise_clip = False  # keyframe-snap clips
+        self.frames_buffer = []
+        self.width = self.height = None
+        self._gpu_codec = None
+        self._is_recording = True
+        cmd = self._build_ffmpeg_cmd()
+        self._ffmpeg_proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=10 ** 8)
+        self._gpu_thread = threading.Thread(target=self._gpu_reader, daemon=True)
+        self._gpu_thread.start()
+        print(f"Screen recording started (GPU pipeline, res={self.target_res}, "
+              f"{int(round(self.fps))}fps).")
+
+    def _stop_gpu(self):
+        self._is_recording = False
+        proc = self._ffmpeg_proc
+        if proc is not None:
+            try:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=2)
+                except Exception:
+                    proc.kill()
+            except Exception:
+                pass
+        if self._gpu_thread is not None:
+            self._gpu_thread.join(timeout=2)
+        self._gpu_thread = None
+        self._ffmpeg_proc = None
+        self._gpu_codec = None
+        self.reset_buffer()
+        print("Screen recording stopped (GPU).")
+
+    # ------------------------------------------------------------------
+    # Public start/stop: route to the GPU pipeline when available, else the
+    # bettercam + cv2 worker-pool fallback.
+    # ------------------------------------------------------------------
     def start(self):
         if self._is_recording:
             print("Already recording.")
             return
+        if self._probe_gpu():
+            self._start_gpu()
+        else:
+            self._start_cpu()
 
+    def stop(self):
+        if not self._is_recording:
+            print("Not currently recording.")
+            return
+        if self._mode == 'gpu':
+            self._stop_gpu()
+        else:
+            self._stop_cpu()
+        self._mode = None
+
+    def _start_cpu(self):
+        self._mode = 'cpu'
+        self.supports_precise_clip = True  # head re-encode gives exact clip start
         while not self.frame_q.empty():
             try:
                 self.frame_q.get_nowait()
@@ -574,11 +798,7 @@ class VID_record:
         self._recording_thread.start()
         print(f"Screen recording started ({self.num_preprocess_workers} preprocess workers).")
 
-    def stop(self):
-        if not self._is_recording:
-            print("Not currently recording.")
-            return
-
+    def _stop_cpu(self):
         #print("Stopping recording...")
         self._is_recording = False
         if self._recording_thread and self._recording_thread.is_alive():
