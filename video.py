@@ -396,6 +396,12 @@ class VID_record:
         # head re-encode isn't reliable alongside the capture pipeline, and with
         # a ~1s GOP the snap is within a second of the requested point).
         self.supports_precise_clip = True
+        # GPU pipeline (ddagrab->nvenc->mpegts->pipe) delays each frame from
+        # capture to when we demux it by a roughly constant latency; the
+        # separately-captured audio is stamped at real time, so without this the
+        # audio leads the video. Subtracted from GPU video stamps. Tune to taste:
+        # if audio still LEADS, increase; if it LAGS, decrease.
+        self.gpu_av_latency = 0.5
 
     def _record_loop(self):
         self.recording_pts = 0
@@ -591,6 +597,13 @@ class VID_record:
         cmd += ['-c:v', 'h264_nvenc', '-preset', 'p4', '-rc', 'vbr', '-cq', '18',
                 '-b:v', str(self.bitrate), '-maxrate', str(self.bitrate * 2),
                 '-bufsize', str(self.bitrate * 4), '-g', str(fps), '-bf', '0',
+                # Force constant frame rate at the target: ddagrab/DDA only delivers
+                # frames as the desktop composites them (well below the monitor
+                # refresh for windowed content), so duplicate to hit <fps>. A real
+                # fullscreen game presenting at <fps> yields all-unique frames.
+                '-r', str(fps),
+                # Low-latency muxing so frames don't sit in the mpegts buffer.
+                '-muxdelay', '0', '-muxpreload', '0', '-flush_packets', '1',
                 '-f', 'mpegts', 'pipe:1']
         return cmd
 
@@ -600,7 +613,11 @@ class VID_record:
         CPU encode worker produces, so encoder.encode_streams is unchanged."""
         proc = self._ffmpeg_proc
         try:
-            container = av.open(_PipeReader(proc.stdout), format='mpegts')
+            # Small probe so PyAV starts delivering packets quickly (keeps the
+            # capture->buffer latency low and stable).
+            container = av.open(_PipeReader(proc.stdout), format='mpegts',
+                                options={'probesize': '32', 'analyzeduration': '0',
+                                         'fflags': 'nobuffer'})
         except Exception as e:
             print(f'GPU reader: could not open ffmpeg stream: {e}')
             return
@@ -637,7 +654,9 @@ class VID_record:
                 if t0_wall is None:
                     t0_wall = time.time()
                     pts0 = packet.pts
-                stamp = t0_wall + float((packet.pts - pts0) * tb)
+                # Subtract the pipeline latency so video stamps line up with the
+                # real-time-stamped audio (otherwise audio leads the video).
+                stamp = t0_wall - self.gpu_av_latency + float((packet.pts - pts0) * tb)
                 kf = bool(packet.is_keyframe)
                 clone = av.Packet(bytes(packet))
                 clone.is_keyframe = kf
