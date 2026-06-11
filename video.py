@@ -17,6 +17,11 @@ try:
 except Exception:
     pass
 
+# Spawn console-subsystem children (engine.exe, ffmpeg.exe) WITHOUT allocating a
+# console window. Without this, a windowed (frozen) build pops a console window
+# for each child process.
+_CREATE_NO_WINDOW = 0x08000000 if os.name == 'nt' else 0
+
 
 import ctypes
 from ctypes import wintypes
@@ -663,7 +668,8 @@ class VID_record:
                    '-f', 'lavfi', '-i', 'ddagrab=framerate=30',
                    '-vf', 'scale_d3d11=640:360:format=nv12',
                    '-c:v', 'h264_nvenc', '-frames:v', '3', '-f', 'null', '-']
-            r = subprocess.run(cmd, capture_output=True, timeout=20)
+            r = subprocess.run(cmd, capture_output=True, timeout=20,
+                               creationflags=_CREATE_NO_WINDOW)
             ok = (r.returncode == 0)
         except Exception as e:
             print(f'GPU capture probe failed: {e}')
@@ -791,10 +797,11 @@ class VID_record:
                 engine_cmd, ffmpeg_cmd = self._build_engine_cmds()
                 self._engine_proc = subprocess.Popen(
                     engine_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                    bufsize=10 ** 8)
+                    bufsize=10 ** 8, creationflags=_CREATE_NO_WINDOW)
                 self._ffmpeg_proc = subprocess.Popen(
                     ffmpeg_cmd, stdin=self._engine_proc.stdout,
-                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=10 ** 8)
+                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=10 ** 8,
+                    creationflags=_CREATE_NO_WINDOW)
                 # ffmpeg now owns the read end; let the engine see EOF if ffmpeg dies.
                 self._engine_proc.stdout.close()
                 self._engine_active = True
@@ -809,7 +816,8 @@ class VID_record:
         if not started:
             cmd = self._build_ffmpeg_cmd()
             self._ffmpeg_proc = subprocess.Popen(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=10 ** 8)
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=10 ** 8,
+                creationflags=_CREATE_NO_WINDOW)
             print(f"Screen recording started (GPU pipeline, res={self.target_res}, "
                   f"{int(round(self.fps))}fps).")
 
