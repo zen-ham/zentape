@@ -1,0 +1,6 @@
+[workspace]
+resolver = "2"
+members = ["hook", "injector", "reader", "engine"]
+
+[profile.release]
+opt-level = 3

@@ -1,1 +1,7 @@
 /clips/
+/engine_src/target/
+/bin/ffmpeg.exe
+/build/
+/dist/
+*.spec.bak
+__pycache__/
