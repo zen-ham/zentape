@@ -14,6 +14,15 @@ import ctypes, win32con, win32gui, win32process
 
 from utils import StreamController
 
+# When frozen by PyInstaller, relative resource paths ('assets/...', the settings
+# file) resolve against the bundle's resource dir, not the launch cwd. Anchor the
+# working directory there so all the existing relative paths keep working.
+if getattr(sys, 'frozen', False):
+    try:
+        os.chdir(getattr(sys, '_MEIPASS', os.path.dirname(sys.executable)))
+    except Exception:
+        pass
+
 # --- ASSET PATHS DICTIONARY ---
 ASSET_PATHS = {
     'logo': 'assets/app_logo.png',

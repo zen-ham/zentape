@@ -3,6 +3,7 @@ import time
 #from ffmpeg_screenshot_pipe import FFmpegshot
 import threading
 import os
+import sys
 import subprocess
 import av
 from fractions import Fraction
@@ -404,6 +405,28 @@ class VID_record:
         # 0.997s +/- 6ms. Tune: if audio still LEADS, increase; if it LAGS, decrease.
         self.gpu_av_latency = 0.997
 
+        # Game-capture engine (zentape_hook.dll + engine.exe). When present, the
+        # capture front-end becomes a Rust engine that owns BOTH DXGI Desktop
+        # Duplication AND a Present-hook into the fullscreen game, auto-switching
+        # between them and emitting one NV12 stream into ffmpeg(nvenc->mpegts).
+        # This captures the game's full present rate (e.g. 180fps) that DDA alone
+        # can't, and falls back to DDA the instant the game isn't the sole
+        # fullscreen window. Everything downstream (mpegts demux, ring buffer,
+        # clip extraction) is identical to the ddagrab path. Only used on the
+        # primary monitor; other monitors use the ddagrab path.
+        self.use_game_capture = True
+        # 'auto' = DDA + hook auto-switch; 'dda' = duplication only (no hooking/
+        # injection); 'hook' = force hook when a fullscreen game is present.
+        self.engine_source = 'auto'
+        self._engine_dir = self._find_engine()
+        self._ffmpeg = self._find_ffmpeg()
+        self._engine_proc = None
+        self._engine_active = False
+        # The engine path adds a GPU readback + an extra pipe vs ddagrab, so its
+        # capture->demux latency differs; calibrate separately. Until measured,
+        # reuse the ddagrab value.
+        self.engine_av_latency = 0.997
+
     def _record_loop(self):
         self.recording_pts = 0
         self.encoding_pts = 0
@@ -561,6 +584,73 @@ class VID_record:
     # ------------------------------------------------------------------
     _gpu_capable = None  # class-level cache: None=unknown, then True/False
 
+    @staticmethod
+    def _resource_bases():
+        """Candidate base dirs for bundled resources (engine.exe, ffmpeg.exe),
+        covering both a PyInstaller --onedir bundle and running from source."""
+        bases = []
+        if getattr(sys, 'frozen', False):
+            mp = getattr(sys, '_MEIPASS', None)
+            if mp:
+                bases.append(mp)
+            exedir = os.path.dirname(sys.executable)
+            bases += [exedir, os.path.join(exedir, '_internal')]
+        here = os.path.dirname(os.path.abspath(__file__))
+        bases += [here, os.path.join(here, 'engine_src', 'target', 'release')]
+        return bases
+
+    @classmethod
+    def _find_engine(cls):
+        """Locate a directory holding engine.exe + zentape_hook.dll, or None.
+        Checks bundled bin/ (frozen or source) then the cargo build output."""
+        for base in cls._resource_bases():
+            for d in (os.path.join(base, 'bin'), base):
+                if (os.path.isfile(os.path.join(d, 'engine.exe'))
+                        and os.path.isfile(os.path.join(d, 'zentape_hook.dll'))):
+                    return os.path.abspath(d)
+        return None
+
+    @classmethod
+    def _find_ffmpeg(cls):
+        """Prefer a bundled bin/ffmpeg.exe; else fall back to 'ffmpeg' on PATH."""
+        for base in cls._resource_bases():
+            for d in (os.path.join(base, 'bin'), base):
+                p = os.path.join(d, 'ffmpeg.exe')
+                if os.path.isfile(p):
+                    return p
+        return 'ffmpeg'
+
+    def _engine_target_res(self):
+        """Even (w, h) the engine should output at, matching the ddagrab path."""
+        nw, nh = _primary_resolution()
+        if self.target_res == 'Screen':
+            tw, th = nw, nh
+        else:
+            tw, th = calculate_scaled_resolution(nw, nh, target_height=int(self.target_res))
+        return tw - tw % 2, th - th % 2
+
+    def _build_engine_cmds(self):
+        """(engine_cmd, ffmpeg_cmd). engine.exe captures DDA/hook -> NV12 on
+        stdout; ffmpeg encodes that rawvideo to h264_nvenc -> mpegts on stdout.
+        ffmpeg timestamps frames by wall-clock arrival (like ddagrab) and forces
+        CFR at <fps>, so the downstream PTS/sync logic is unchanged."""
+        fps = max(1, int(round(self.fps)))
+        tw, th = self._engine_target_res()
+        src = self.engine_source if self.engine_source in ('auto', 'dda', 'hook') else 'auto'
+        engine_cmd = [os.path.join(self._engine_dir, 'engine.exe'),
+                      '--source', src, '--w', str(tw), '--h', str(th)]
+        ffmpeg_cmd = [self._ffmpeg, '-hide_banner', '-loglevel', 'error',
+                      '-use_wallclock_as_timestamps', '1',
+                      '-f', 'rawvideo', '-pix_fmt', 'nv12', '-s', f'{tw}x{th}',
+                      '-i', 'pipe:0',
+                      '-c:v', 'h264_nvenc', '-preset', 'p4', '-rc', 'vbr', '-cq', '18',
+                      '-b:v', str(self.bitrate), '-maxrate', str(self.bitrate * 2),
+                      '-bufsize', str(self.bitrate * 4), '-g', str(fps), '-bf', '0',
+                      '-r', str(fps), '-fps_mode', 'cfr',
+                      '-muxdelay', '0', '-muxpreload', '0', '-flush_packets', '1',
+                      '-f', 'mpegts', 'pipe:1']
+        return engine_cmd, ffmpeg_cmd
+
     @classmethod
     def _probe_gpu(cls):
         """Check once whether the GPU capture pipeline works on this machine
@@ -569,7 +659,7 @@ class VID_record:
             return cls._gpu_capable
         ok = False
         try:
-            cmd = ['ffmpeg', '-hide_banner', '-loglevel', 'error',
+            cmd = [cls._find_ffmpeg(), '-hide_banner', '-loglevel', 'error',
                    '-f', 'lavfi', '-i', 'ddagrab=framerate=30',
                    '-vf', 'scale_d3d11=640:360:format=nv12',
                    '-c:v', 'h264_nvenc', '-frames:v', '3', '-f', 'null', '-']
@@ -584,7 +674,7 @@ class VID_record:
 
     def _build_ffmpeg_cmd(self):
         fps = max(1, int(round(self.fps)))
-        cmd = ['ffmpeg', '-hide_banner', '-loglevel', 'error',
+        cmd = [self._ffmpeg, '-hide_banner', '-loglevel', 'error',
                '-f', 'lavfi',
                '-i', (f'ddagrab=framerate={fps}'
                       f':draw_mouse={1 if self.record_mouse else 0}'
@@ -656,8 +746,10 @@ class VID_record:
                     t0_wall = time.time()
                     pts0 = packet.pts
                 # Subtract the pipeline latency so video stamps line up with the
-                # real-time-stamped audio (otherwise audio leads the video).
-                stamp = t0_wall - self.gpu_av_latency + float((packet.pts - pts0) * tb)
+                # real-time-stamped audio (otherwise audio leads the video). The
+                # engine path has its own measured latency.
+                lat = self.engine_av_latency if self._engine_active else self.gpu_av_latency
+                stamp = t0_wall - lat + float((packet.pts - pts0) * tb)
                 kf = bool(packet.is_keyframe)
                 clone = av.Packet(bytes(packet))
                 clone.is_keyframe = kf
@@ -685,31 +777,78 @@ class VID_record:
         self.frames_buffer = []
         self.width = self.height = None
         self._gpu_codec = None
+        self._engine_proc = None
+        self._engine_active = False
         self._is_recording = True
-        cmd = self._build_ffmpeg_cmd()
-        self._ffmpeg_proc = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=10 ** 8)
+
+        # Prefer the game-capture engine (DDA + Present-hook auto-switch) on the
+        # primary monitor; fall back to the single ddagrab ffmpeg otherwise.
+        use_engine = (self.use_game_capture and self._engine_dir is not None
+                      and self.monitor_index == 0)
+        started = False
+        if use_engine:
+            try:
+                engine_cmd, ffmpeg_cmd = self._build_engine_cmds()
+                self._engine_proc = subprocess.Popen(
+                    engine_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                    bufsize=10 ** 8)
+                self._ffmpeg_proc = subprocess.Popen(
+                    ffmpeg_cmd, stdin=self._engine_proc.stdout,
+                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=10 ** 8)
+                # ffmpeg now owns the read end; let the engine see EOF if ffmpeg dies.
+                self._engine_proc.stdout.close()
+                self._engine_active = True
+                started = True
+                print(f"Screen recording started (GPU engine: DDA+hook auto-switch, "
+                      f"res={self.target_res}, {int(round(self.fps))}fps).")
+            except Exception as e:
+                print(f"Game-capture engine failed to start ({e}); "
+                      f"falling back to ddagrab.")
+                self._cleanup_engine_procs()
+
+        if not started:
+            cmd = self._build_ffmpeg_cmd()
+            self._ffmpeg_proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=10 ** 8)
+            print(f"Screen recording started (GPU pipeline, res={self.target_res}, "
+                  f"{int(round(self.fps))}fps).")
+
         self._gpu_thread = threading.Thread(target=self._gpu_reader, daemon=True)
         self._gpu_thread.start()
-        print(f"Screen recording started (GPU pipeline, res={self.target_res}, "
-              f"{int(round(self.fps))}fps).")
+
+    def _cleanup_engine_procs(self):
+        for attr in ('_ffmpeg_proc', '_engine_proc'):
+            proc = getattr(self, attr, None)
+            if proc is not None:
+                try:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=2)
+                    except Exception:
+                        proc.kill()
+                except Exception:
+                    pass
+            setattr(self, attr, None)
 
     def _stop_gpu(self):
         self._is_recording = False
-        proc = self._ffmpeg_proc
-        if proc is not None:
-            try:
-                proc.terminate()
+        # Stop ffmpeg first (its EOF lets the engine exit), then the engine.
+        for proc in (self._ffmpeg_proc, self._engine_proc):
+            if proc is not None:
                 try:
-                    proc.wait(timeout=2)
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=2)
+                    except Exception:
+                        proc.kill()
                 except Exception:
-                    proc.kill()
-            except Exception:
-                pass
+                    pass
         if self._gpu_thread is not None:
             self._gpu_thread.join(timeout=2)
         self._gpu_thread = None
         self._ffmpeg_proc = None
+        self._engine_proc = None
+        self._engine_active = False
         self._gpu_codec = None
         self.reset_buffer()
         print("Screen recording stopped (GPU).")
