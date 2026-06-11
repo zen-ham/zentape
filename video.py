@@ -399,9 +399,10 @@ class VID_record:
         # GPU pipeline (ddagrab->nvenc->mpegts->pipe) delays each frame from
         # capture to when we demux it by a roughly constant latency; the
         # separately-captured audio is stamped at real time, so without this the
-        # audio leads the video. Subtracted from GPU video stamps. Tune to taste:
-        # if audio still LEADS, increase; if it LAGS, decrease.
-        self.gpu_av_latency = 0.5
+        # audio leads the video. Subtracted from GPU video stamps. Value measured
+        # by perf_lab/av_sync_measure.py (flash + 19kHz tone): audio led by
+        # 0.997s +/- 6ms. Tune: if audio still LEADS, increase; if it LAGS, decrease.
+        self.gpu_av_latency = 0.997
 
     def _record_loop(self):
         self.recording_pts = 0
