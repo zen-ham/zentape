@@ -406,9 +406,10 @@ class VID_record:
         # capture to when we demux it by a roughly constant latency; the
         # separately-captured audio is stamped at real time, so without this the
         # audio leads the video. Subtracted from GPU video stamps. Value measured
-        # by perf_lab/av_sync_measure.py (flash + 19kHz tone): audio led by
-        # 0.997s +/- 6ms. Tune: if audio still LEADS, increase; if it LAGS, decrease.
-        self.gpu_av_latency = 0.997
+        # by perf_lab/av_sync_measure.py (flash + 19kHz tone). Re-measured cleanly
+        # (loud tone, all 6 onsets, std 7ms): at 0.997 audio led by 16ms, so 1.013
+        # centers it. Tune: if audio still LEADS, increase; if it LAGS, decrease.
+        self.gpu_av_latency = 1.013
 
         # Game-capture engine (zentape_hook.dll + engine.exe). When present, the
         # capture front-end becomes a Rust engine that owns BOTH DXGI Desktop
