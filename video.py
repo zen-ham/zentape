@@ -434,6 +434,10 @@ class VID_record:
         self._ffmpeg = self._find_ffmpeg()
         self._engine_proc = None
         self._engine_active = False
+        # Per-frame capture timestamps reported by the engine on its stderr,
+        # paired 1:1 with the video packets for exact A/V sync.
+        self._engine_ts_q = queue.Queue()
+        self._engine_stderr_thread = None
         # The engine path has its own capture->demux latency. Measured cleanly via
         # av_sync_measure.py (engine enabled, all 6 onsets, std 6ms): at 0.997 audio
         # lagged 338ms, so 0.659 centers it.
@@ -755,19 +759,23 @@ class VID_record:
                     break
                 if packet.pts is None or packet.dts is None or packet.size == 0:
                     continue
-                # Stamp from ffmpeg's frame PTS (accurately paced by ddagrab),
-                # NOT the pipe arrival time -- PyAV delivers packets in bursts, so
-                # arrival times are clumped and would collapse the clip's PTS.
-                # Anchor to the first frame's wall clock so the stamp still tracks
-                # real time for buffer eviction.
-                if t0_wall is None:
-                    t0_wall = time.time()
-                    pts0 = packet.pts
-                # Subtract the pipeline latency so video stamps line up with the
-                # real-time-stamped audio (otherwise audio leads the video). The
-                # engine path has its own measured latency.
-                lat = self.engine_av_latency if self._engine_active else self.gpu_av_latency
-                stamp = t0_wall - lat + float((packet.pts - pts0) * tb)
+                # A/V sync: prefer the engine's per-frame capture wall-clock --
+                # exact real time, paired 1:1 with packets (no B-frames, so packet
+                # order == emit order). No latency guess, no drift over long clips.
+                # Fall back to the latency-offset method for the ddagrab path or if
+                # a timestamp isn't available.
+                stamp = None
+                if self._engine_active:
+                    try:
+                        stamp = self._engine_ts_q.get(timeout=0.5)
+                    except Exception:
+                        stamp = None
+                if stamp is None:
+                    if t0_wall is None:
+                        t0_wall = time.time()
+                        pts0 = packet.pts
+                    lat = self.engine_av_latency if self._engine_active else self.gpu_av_latency
+                    stamp = t0_wall - lat + float((packet.pts - pts0) * tb)
                 kf = bool(packet.is_keyframe)
                 clone = av.Packet(bytes(packet))
                 clone.is_keyframe = kf
@@ -789,6 +797,21 @@ class VID_record:
             except Exception:
                 pass
 
+    def _engine_stderr_reader(self, proc):
+        """Drain the engine's stderr and collect its per-frame ZTTS capture
+        timestamps (Unix time), pushed in emit order to pair 1:1 with the video
+        packets. Also keeps the stderr pipe from filling (which would stall the
+        engine)."""
+        try:
+            for raw in iter(proc.stderr.readline, b''):
+                if raw[:5] == b'ZTTS ':
+                    try:
+                        self._engine_ts_q.put(float(raw[5:]))
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
     def _start_gpu(self):
         self._mode = 'gpu'
         self.supports_precise_clip = False  # keyframe-snap clips
@@ -797,6 +820,7 @@ class VID_record:
         self._gpu_codec = None
         self._engine_proc = None
         self._engine_active = False
+        self._engine_ts_q = queue.Queue()  # fresh per session
         self._is_recording = True
 
         # Prefer the game-capture engine (DDA + Present-hook auto-switch) on the
@@ -808,7 +832,7 @@ class VID_record:
             try:
                 engine_cmd, ffmpeg_cmd = self._build_engine_cmds()
                 self._engine_proc = subprocess.Popen(
-                    engine_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                    engine_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                     bufsize=10 ** 8, creationflags=_CREATE_NO_WINDOW)
                 self._ffmpeg_proc = subprocess.Popen(
                     ffmpeg_cmd, stdin=self._engine_proc.stdout,
@@ -817,6 +841,10 @@ class VID_record:
                 # ffmpeg now owns the read end; let the engine see EOF if ffmpeg dies.
                 self._engine_proc.stdout.close()
                 self._engine_active = True
+                # Drain engine stderr + collect per-frame timestamps.
+                self._engine_stderr_thread = threading.Thread(
+                    target=self._engine_stderr_reader, args=(self._engine_proc,), daemon=True)
+                self._engine_stderr_thread.start()
                 started = True
                 print(f"Screen recording started (GPU engine: DDA+hook auto-switch, "
                       f"res={self.target_res}, {int(round(self.fps))}fps).")

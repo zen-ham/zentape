@@ -622,6 +622,13 @@ fn main() -> Result<()> {
         let mut dumped = args.dumpframe.is_none();
 
         let start = Instant::now();
+        // Wall-clock (Unix) of `start`, so a frame's paced slot time is
+        // system_anchor + next_emit_t -- even-spaced (smooth) AND real-time
+        // anchored (exact A/V sync, no drift).
+        let system_anchor = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
         let mut sec_mark = Instant::now();
         let (mut emitted, mut sec_emit) = (0u64, 0u64);
         let mut sec_hook = 0u64;
@@ -837,9 +844,16 @@ fn main() -> Result<()> {
                 }
                 if let Some(f) = file_sink.as_mut() {
                     f.write_all(&buf).unwrap();
-                } else if args.to_stdout && so.write_all(&buf).is_err() {
-                    done = true;
-                    break;
+                } else if args.to_stdout {
+                    if so.write_all(&buf).is_err() {
+                        done = true;
+                        break;
+                    }
+                    // Per-frame slot wall-clock (Unix) for exact A/V sync: Python
+                    // pairs these 1:1 with the video packets. The slot time is
+                    // even-spaced (smooth) and real-time anchored (no drift, no
+                    // latency guess). next_emit_t here is this frame's slot.
+                    elog!("ZTTS {:.6}", system_anchor + next_emit_t);
                 }
                 emitted += 1;
                 sec_emit += 1;
