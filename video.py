@@ -419,7 +419,12 @@ class VID_record:
         # fullscreen window. Everything downstream (mpegts demux, ring buffer,
         # clip extraction) is identical to the ddagrab path. Only used on the
         # primary monitor; other monitors use the ddagrab path.
-        self.use_game_capture = True
+        #
+        # OPT-IN for now: the engine's DDA path does not yet composite the OS
+        # mouse cursor (DXGI Duplication omits it), and its A/V latency isn't
+        # calibrated. The proven ffmpeg-ddagrab path (draw_mouse + measured sync)
+        # is the default until those are fixed. Set True to use the 180fps engine.
+        self.use_game_capture = False
         # 'auto' = DDA + hook auto-switch; 'dda' = duplication only (no hooking/
         # injection); 'hook' = force hook when a fullscreen game is present.
         self.engine_source = 'auto'
