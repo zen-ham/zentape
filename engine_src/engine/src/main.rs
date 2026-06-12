@@ -32,10 +32,15 @@ use windows::Win32::System::Memory::*;
 use windows::Win32::System::Threading::{
     CreateRemoteThread, OpenProcess, WaitForSingleObject, PROCESS_ALL_ACCESS,
 };
+use windows::Win32::Graphics::Gdi::{DeleteObject, HGDIOBJ};
+use windows::Win32::UI::HiDpi::{
+    SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetClassNameW, GetForegroundWindow, GetTopWindow, GetWindow, GetWindowLongPtrW, GetWindowRect,
-    GetWindowThreadProcessId, IsWindowVisible, GW_HWNDNEXT, GWL_EXSTYLE, WS_EX_NOACTIVATE,
-    WS_EX_TRANSPARENT,
+    DrawIconEx, GetClassNameW, GetCursorInfo, GetForegroundWindow, GetIconInfo, GetTopWindow,
+    GetWindow, GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId, IsWindowVisible,
+    CURSORINFO, CURSOR_SHOWING, DI_NORMAL, GW_HWNDNEXT, GWL_EXSTYLE, HCURSOR, HICON, ICONINFO,
+    WS_EX_NOACTIVATE, WS_EX_TRANSPARENT,
 };
 
 #[repr(C)]
@@ -64,8 +69,10 @@ struct Args {
     w: u32,
     h: u32,
     secs: f64,
+    fps: f64,
     source: Source,
     to_stdout: bool,
+    cursor: bool,
     out: Option<String>,
     dumpframe: Option<String>,
     dumplast: Option<String>,
@@ -73,8 +80,8 @@ struct Args {
 
 fn parse_args() -> Args {
     let mut a = Args {
-        w: 1280, h: 720, secs: 0.0, source: Source::Dda,
-        to_stdout: true, out: None, dumpframe: None, dumplast: None,
+        w: 1280, h: 720, secs: 0.0, fps: 180.0, source: Source::Dda,
+        to_stdout: true, cursor: true, out: None, dumpframe: None, dumplast: None,
     };
     let argv: Vec<String> = std::env::args().collect();
     let mut i = 1;
@@ -83,6 +90,8 @@ fn parse_args() -> Args {
             "--w" => { a.w = argv[i + 1].parse().unwrap(); i += 2; }
             "--h" => { a.h = argv[i + 1].parse().unwrap(); i += 2; }
             "--secs" => { a.secs = argv[i + 1].parse().unwrap(); i += 2; }
+            "--fps" => { a.fps = argv[i + 1].parse().unwrap(); i += 2; }
+            "--no-cursor" => { a.cursor = false; i += 1; }
             "--source" => {
                 a.source = match argv[i + 1].as_str() {
                     "hook" => Source::Hook,
@@ -476,6 +485,57 @@ unsafe fn convert_blt(ctx: &ID3D11DeviceContext, cp: &ConvertPass, hc: &HookConv
     ctx.PSSetShaderResources(0, Some(&[None]));
 }
 
+// ---- OS cursor draw (DDA path) ----
+// Draw the live OS cursor straight onto the captured BGRA frame via GDI before
+// downscale. DrawIconEx does native mask/XOR blending, so inverting cursors (the
+// I-beam over text) come out correct -- the same Win32 call the Python path used.
+// The BGRA texture is created GDI-compatible so IDXGISurface1::GetDC works.
+unsafe fn cursor_hotspot(hcur: HCURSOR) -> (i32, i32) {
+    let mut ii = ICONINFO::default();
+    if GetIconInfo(HICON(hcur.0), &mut ii).is_ok() {
+        let hs = (ii.xHotspot as i32, ii.yHotspot as i32);
+        if !ii.hbmColor.is_invalid() {
+            let _ = DeleteObject(HGDIOBJ(ii.hbmColor.0));
+        }
+        if !ii.hbmMask.is_invalid() {
+            let _ = DeleteObject(HGDIOBJ(ii.hbmMask.0));
+        }
+        hs
+    } else {
+        (0, 0)
+    }
+}
+
+unsafe fn draw_cursor(bgra: &ID3D11Texture2D, cache: &mut (usize, (i32, i32))) {
+    let mut ci = CURSORINFO {
+        cbSize: std::mem::size_of::<CURSORINFO>() as u32,
+        ..Default::default()
+    };
+    if GetCursorInfo(&mut ci).is_err() || ci.flags.0 != CURSOR_SHOWING.0 {
+        return;
+    }
+    let hcur = ci.hCursor;
+    if (hcur.0 as usize) == 0 {
+        return;
+    }
+    let key = hcur.0 as usize;
+    let hot = if cache.0 == key {
+        cache.1
+    } else {
+        let h = cursor_hotspot(hcur);
+        *cache = (key, h);
+        h
+    };
+    let x = ci.ptScreenPos.x - hot.0;
+    let y = ci.ptScreenPos.y - hot.1;
+    if let Ok(surface) = bgra.cast::<IDXGISurface1>() {
+        if let Ok(hdc) = surface.GetDC(false) {
+            let _ = DrawIconEx(hdc, x, y, HICON(hcur.0), 0, 0, 0, None, DI_NORMAL);
+            let _ = surface.ReleaseDC(None);
+        }
+    }
+}
+
 fn main() -> Result<()> {
     let args = parse_args();
     let (dst_w, dst_h) = (args.w, args.h);
@@ -487,6 +547,9 @@ fn main() -> Result<()> {
     elog!("engine: target {}x{} nv12, secs={}, source={}", dst_w, dst_h, args.secs, want);
 
     unsafe {
+        // Physical-pixel coordinates for cursor position + window rects.
+        let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+
         // --- D3D11 device (BGRA + video support) ---
         let mut device: Option<ID3D11Device> = None;
         let mut context: Option<ID3D11DeviceContext> = None;
@@ -538,7 +601,8 @@ fn main() -> Result<()> {
             SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
             Usage: D3D11_USAGE_DEFAULT,
             BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
-            CPUAccessFlags: 0, MiscFlags: 0,
+            CPUAccessFlags: 0,
+            MiscFlags: if args.cursor { D3D11_RESOURCE_MISC_GDI_COMPATIBLE.0 as u32 } else { 0 },
         };
         let mut bgra: Option<ID3D11Texture2D> = None;
         device.CreateTexture2D(&bgra_desc, None, Some(&mut bgra))?;
@@ -577,6 +641,19 @@ fn main() -> Result<()> {
         let mut injected: Vec<u32> = Vec::new();
         let mut target_pid: Option<u32> = None;
         let mut stall = 0u32; // consecutive evals with no new hook frame
+
+        // Output pacing: emit a steady `fps` frames/sec in real time. Capture runs
+        // as fast as it can into the NV12 target (marking it dirty); the emit step
+        // writes one frame per real-time slot (reading back only when there's new
+        // content, duplicating otherwise). Even, paced writes -> ffmpeg reads
+        // evenly -> its CFR step stops dropping the bursts a free-running emit made.
+        let period = 1.0 / args.fps.max(1.0);
+        let mut nv12_valid = false; // NV12 target has at least one captured frame
+        let mut nv12_dirty = false; // new content captured since last readback
+        let mut next_emit_t = 0.0f64; // wall-clock time of the next output slot
+        let mut started = false;
+        let mut done = false;
+        let mut cursor_cache: (usize, (i32, i32)) = (0, (0, 0)); // hcursor -> hotspot
 
         loop {
             if args.secs > 0.0 && start.elapsed().as_secs_f64() >= args.secs {
@@ -664,27 +741,25 @@ fn main() -> Result<()> {
             // Decide source for this frame (auto_use_hook stays false in DDA mode).
             let use_hook = auto_use_hook;
 
-            let got_frame;
+            // CAPTURE: pull the newest source frame into the NV12 target and mark
+            // it dirty. No emit here -- emission is paced below so writes are even.
             if use_hook {
                 let (info, _tex, hc, hp, last_copied) = hook.as_mut().unwrap();
-                // Emit only when the hook copied a new backbuffer (true unique rate).
                 let copied = std::ptr::read_volatile(&(**info).copied_count);
                 if copied != *last_copied {
                     *last_copied = copied;
                     let mut d = D3D11_TEXTURE2D_DESC::default();
                     hc.inter.GetDesc(&mut d);
-                    convert_blt(&context, &convert, hc, d.Width, d.Height); // any-fmt -> BGRA inter
+                    convert_blt(&context, &convert, hc, d.Width, d.Height); // any-fmt -> BGRA
                     vp_blt(&vctx, hp)?; // BGRA inter -> NV12 (scale)
+                    nv12_valid = true;
+                    nv12_dirty = true;
                     sec_hook += 1;
-                    got_frame = true;
-                } else {
-                    got_frame = false;
                 }
             } else {
-                // DDA path.
                 let mut fi = DXGI_OUTDUPL_FRAME_INFO::default();
                 let mut res: Option<IDXGIResource> = None;
-                match dup.AcquireNextFrame(8, &mut fi, &mut res) {
+                match dup.AcquireNextFrame(2, &mut fi, &mut res) {
                     Ok(_) => {
                         if let Some(res) = res.as_ref() {
                             if let Ok(frame_tex) = res.cast::<ID3D11Texture2D>() {
@@ -692,64 +767,100 @@ fn main() -> Result<()> {
                             }
                         }
                         let _ = dup.ReleaseFrame();
+                        if args.cursor {
+                            draw_cursor(&bgra, &mut cursor_cache); // OS cursor onto BGRA
+                        }
                         vp_blt(&vctx, &dda_path)?;
+                        nv12_valid = true;
+                        nv12_dirty = true;
                         sec_dda += 1;
-                        got_frame = true;
                     }
-                    Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => { got_frame = false; }
+                    Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => {}
                     Err(_e) => {
-                        // ACCESS_LOST etc -- e.g. a game took TRUE exclusive
-                        // fullscreen (DDA can't see FSE). Don't die: try to
-                        // recreate the duplication; if that fails (FSE active),
-                        // skip and let the hook path cover it once attached.
+                        // ACCESS_LOST etc -- a game took TRUE exclusive fullscreen
+                        // (DDA can't see FSE). Don't die: recreate the duplication;
+                        // if that fails (FSE active), skip and let the hook cover it.
                         match output1.DuplicateOutput(&device) {
                             Ok(d) => dup = d,
                             Err(_) => std::thread::sleep(std::time::Duration::from_millis(40)),
                         }
-                        got_frame = false;
                     }
                 }
             }
 
-            if !got_frame {
-                // Avoid a busy-spin when nothing new is available on the hook path.
-                if use_hook {
-                    std::thread::sleep(std::time::Duration::from_micros(200));
-                }
-                continue;
+            // EMIT (capture-aligned pacing): hold a steady `fps` output, but emit
+            // each fresh capture as it arrives (up to one slot early) so unique
+            // frames aren't lost to capture/slot phase misalignment; duplicate the
+            // last frame to fill slots when the source is slower than `fps`.
+            let now = start.elapsed().as_secs_f64();
+            if nv12_valid && !started {
+                next_emit_t = now;
+                started = true;
             }
-
-            // Readback NV12 + emit tightly packed.
-            context.CopyResource(&stage, &nv12);
-            let mut m = D3D11_MAPPED_SUBRESOURCE::default();
-            if context.Map(&stage, 0, D3D11_MAP_READ, 0, Some(&mut m)).is_ok() {
-                let base = m.pData as *const u8;
-                let pitch = m.RowPitch as usize;
-                let (w, h) = (dst_w as usize, dst_h as usize);
-                for row in 0..h {
-                    std::ptr::copy_nonoverlapping(
-                        base.add(row * pitch), buf.as_mut_ptr().add(row * w), w);
-                }
-                let (uv_dst0, uv_src0) = (w * h, pitch * h);
-                for row in 0..(h / 2) {
-                    std::ptr::copy_nonoverlapping(
-                        base.add(uv_src0 + row * pitch), buf.as_mut_ptr().add(uv_dst0 + row * w), w);
-                }
-                context.Unmap(&stage, 0);
-
-                if !dumped {
-                    let p = args.dumpframe.as_ref().unwrap();
-                    std::fs::write(p, &buf).unwrap();
-                    elog!("engine: dumped one NV12 frame to {} ({} bytes)", p, buf.len());
-                    dumped = true;
+            while nv12_valid {
+                let slot_due = now >= next_emit_t;
+                if nv12_dirty {
+                    // Don't run more than ~one period ahead of real time.
+                    if !slot_due && (now + period) < next_emit_t {
+                        break;
+                    }
+                    context.CopyResource(&stage, &nv12);
+                    let mut m = D3D11_MAPPED_SUBRESOURCE::default();
+                    if context.Map(&stage, 0, D3D11_MAP_READ, 0, Some(&mut m)).is_ok() {
+                        let base = m.pData as *const u8;
+                        let pitch = m.RowPitch as usize;
+                        let (w, h) = (dst_w as usize, dst_h as usize);
+                        for row in 0..h {
+                            std::ptr::copy_nonoverlapping(
+                                base.add(row * pitch), buf.as_mut_ptr().add(row * w), w);
+                        }
+                        let (uv_dst0, uv_src0) = (w * h, pitch * h);
+                        for row in 0..(h / 2) {
+                            std::ptr::copy_nonoverlapping(
+                                base.add(uv_src0 + row * pitch),
+                                buf.as_mut_ptr().add(uv_dst0 + row * w), w);
+                        }
+                        context.Unmap(&stage, 0);
+                        nv12_dirty = false;
+                        if !dumped {
+                            let p = args.dumpframe.as_ref().unwrap();
+                            std::fs::write(p, &buf).unwrap();
+                            elog!("engine: dumped one NV12 frame to {} ({} bytes)", p, buf.len());
+                            dumped = true;
+                        }
+                    } else {
+                        break;
+                    }
+                } else if !slot_due {
+                    // no fresh content and the slot isn't due -> wait
+                    break;
                 }
                 if let Some(f) = file_sink.as_mut() {
                     f.write_all(&buf).unwrap();
                 } else if args.to_stdout && so.write_all(&buf).is_err() {
+                    done = true;
                     break;
                 }
                 emitted += 1;
                 sec_emit += 1;
+                next_emit_t += period;
+                if next_emit_t < now - 0.25 {
+                    next_emit_t = now; // anti-spiral: resync if far behind
+                }
+            }
+            if done {
+                break;
+            }
+            // Idle nap (hook path) so we don't busy-spin between slots; the DDA
+            // path already waits up to 2ms inside AcquireNextFrame.
+            if use_hook && nv12_valid && !nv12_dirty {
+                let now2 = start.elapsed().as_secs_f64();
+                if next_emit_t > now2 {
+                    let nap_us = (((next_emit_t - now2) * 1_000_000.0) as u64).min(1500);
+                    if nap_us > 0 {
+                        std::thread::sleep(std::time::Duration::from_micros(nap_us));
+                    }
+                }
             }
 
             if sec_mark.elapsed().as_secs_f64() >= 1.0 {

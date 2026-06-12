@@ -421,11 +421,12 @@ class VID_record:
         # clip extraction) is identical to the ddagrab path. Only used on the
         # primary monitor; other monitors use the ddagrab path.
         #
-        # OPT-IN for now: the engine's DDA path does not yet composite the OS
-        # mouse cursor (DXGI Duplication omits it), and its A/V latency isn't
-        # calibrated. The proven ffmpeg-ddagrab path (draw_mouse + measured sync)
-        # is the default until those are fixed. Set True to use the 180fps engine.
-        self.use_game_capture = False
+        # The engine path now (a) paces its output to a steady real-time fps so
+        # ffmpeg keeps every captured frame (smooth ~165 unique fps vs ddagrab's
+        # ~130), and (b) composites the OS cursor (incl. inverting I-beam) via
+        # DrawIconEx. Default ON for the higher unique-frame rate; set False to
+        # use the ffmpeg-ddagrab path.
+        self.use_game_capture = True
         # 'auto' = DDA + hook auto-switch; 'dda' = duplication only (no hooking/
         # injection); 'hook' = force hook when a fullscreen game is present.
         self.engine_source = 'auto'
@@ -433,10 +434,10 @@ class VID_record:
         self._ffmpeg = self._find_ffmpeg()
         self._engine_proc = None
         self._engine_active = False
-        # The engine path adds a GPU readback + an extra pipe vs ddagrab, so its
-        # capture->demux latency differs; calibrate separately. Until measured,
-        # reuse the ddagrab value.
-        self.engine_av_latency = 0.997
+        # The engine path has its own capture->demux latency. Measured cleanly via
+        # av_sync_measure.py (engine enabled, all 6 onsets, std 6ms): at 0.997 audio
+        # lagged 338ms, so 0.659 centers it.
+        self.engine_av_latency = 0.659
 
     def _record_loop(self):
         self.recording_pts = 0
@@ -649,15 +650,20 @@ class VID_record:
         tw, th = self._engine_target_res()
         src = self.engine_source if self.engine_source in ('auto', 'dda', 'hook') else 'auto'
         engine_cmd = [os.path.join(self._engine_dir, 'engine.exe'),
-                      '--source', src, '--w', str(tw), '--h', str(th)]
+                      '--source', src, '--w', str(tw), '--h', str(th), '--fps', str(fps)]
+        if not self.record_mouse:
+            engine_cmd.append('--no-cursor')
+        # The engine paces its output to a steady real-time `fps`, so ffmpeg must
+        # assign PTS by frame ORDER (-framerate) and pass frames through unchanged.
+        # (use_wallclock_as_timestamps + CFR stamped by bursty pipe-read times,
+        # which dropped/duplicated ~half the frames -> choppy playback.)
         ffmpeg_cmd = [self._ffmpeg, '-hide_banner', '-loglevel', 'error',
-                      '-use_wallclock_as_timestamps', '1',
                       '-f', 'rawvideo', '-pix_fmt', 'nv12', '-s', f'{tw}x{th}',
-                      '-i', 'pipe:0',
+                      '-framerate', str(fps), '-i', 'pipe:0',
                       '-c:v', 'h264_nvenc', '-preset', 'p4', '-rc', 'vbr', '-cq', '18',
                       '-b:v', str(self.bitrate), '-maxrate', str(self.bitrate * 2),
                       '-bufsize', str(self.bitrate * 4), '-g', str(fps), '-bf', '0',
-                      '-r', str(fps), '-fps_mode', 'cfr',
+                      '-fps_mode', 'passthrough',
                       '-muxdelay', '0', '-muxpreload', '0', '-flush_packets', '1',
                       '-f', 'mpegts', 'pipe:1']
         return engine_cmd, ffmpeg_cmd
