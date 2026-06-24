@@ -7,6 +7,13 @@ edition = "2021"
 name = "engine"
 path = "src/main.rs"
 
+[dependencies]
+# Shared DDA capture foundation. See SHARED_DDA_CAPTURE_CRATE.md in the
+# zentape root for the design + why this exists. Both zentape (this binary)
+# and rustcam (PyO3 Python extension at github.com/zen-ham/rustcam) depend
+# on the same crate so the cursor compositor fix lives in one place.
+dda_capture = { git = "https://github.com/zen-ham/dda_capture", branch = "master" }
+
 [dependencies.windows]
 version = "0.62"
 features = [

@@ -25,9 +25,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 
 [[package]]
+name = "dda_capture"
+version = "0.1.0"
+source = "git+https://github.com/zen-ham/dda_capture?branch=master#8ecaeaf2c81b89ae137342b5eedcd132f1f723fb"
+dependencies = [
+ "windows",
+]
+
+[[package]]
 name = "engine"
 version = "0.1.0"
 dependencies = [
+ "dda_capture",
  "windows",
 ]
 

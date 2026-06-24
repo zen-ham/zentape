@@ -32,16 +32,19 @@ use windows::Win32::System::Memory::*;
 use windows::Win32::System::Threading::{
     CreateRemoteThread, OpenProcess, WaitForSingleObject, PROCESS_ALL_ACCESS,
 };
-use windows::Win32::Graphics::Gdi::{DeleteObject, HGDIOBJ};
 use windows::Win32::UI::HiDpi::{
     SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    DrawIconEx, GetClassNameW, GetCursorInfo, GetForegroundWindow, GetIconInfo, GetTopWindow,
-    GetWindow, GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId, IsWindowVisible,
-    CURSORINFO, CURSOR_SHOWING, DI_NORMAL, GW_HWNDNEXT, GWL_EXSTYLE, HCURSOR, HICON, ICONINFO,
+    GetClassNameW, GetForegroundWindow, GetTopWindow, GetWindow, GetWindowLongPtrW,
+    GetWindowRect, GetWindowThreadProcessId, IsWindowVisible, GW_HWNDNEXT, GWL_EXSTYLE,
     WS_EX_NOACTIVATE, WS_EX_TRANSPARENT,
 };
+
+// Shared software cursor compositor + DDA helpers. See
+// SHARED_DDA_CAPTURE_CRATE.md and CURSOR_GDI_HIDDEN_BOTTLENECK.md in the
+// zentape root for why this exists. Same code rustcam uses.
+use dda_capture::cursor::{composite_cursor_into_bgra, CursorState};
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -485,56 +488,15 @@ unsafe fn convert_blt(ctx: &ID3D11DeviceContext, cp: &ConvertPass, hc: &HookConv
     ctx.PSSetShaderResources(0, Some(&[None]));
 }
 
-// ---- OS cursor draw (DDA path) ----
-// Draw the live OS cursor straight onto the captured BGRA frame via GDI before
-// downscale. DrawIconEx does native mask/XOR blending, so inverting cursors (the
-// I-beam over text) come out correct -- the same Win32 call the Python path used.
-// The BGRA texture is created GDI-compatible so IDXGISurface1::GetDC works.
-unsafe fn cursor_hotspot(hcur: HCURSOR) -> (i32, i32) {
-    let mut ii = ICONINFO::default();
-    if GetIconInfo(HICON(hcur.0), &mut ii).is_ok() {
-        let hs = (ii.xHotspot as i32, ii.yHotspot as i32);
-        if !ii.hbmColor.is_invalid() {
-            let _ = DeleteObject(HGDIOBJ(ii.hbmColor.0));
-        }
-        if !ii.hbmMask.is_invalid() {
-            let _ = DeleteObject(HGDIOBJ(ii.hbmMask.0));
-        }
-        hs
-    } else {
-        (0, 0)
-    }
-}
-
-unsafe fn draw_cursor(bgra: &ID3D11Texture2D, cache: &mut (usize, (i32, i32))) {
-    let mut ci = CURSORINFO {
-        cbSize: std::mem::size_of::<CURSORINFO>() as u32,
-        ..Default::default()
-    };
-    if GetCursorInfo(&mut ci).is_err() || ci.flags.0 != CURSOR_SHOWING.0 {
-        return;
-    }
-    let hcur = ci.hCursor;
-    if (hcur.0 as usize) == 0 {
-        return;
-    }
-    let key = hcur.0 as usize;
-    let hot = if cache.0 == key {
-        cache.1
-    } else {
-        let h = cursor_hotspot(hcur);
-        *cache = (key, h);
-        h
-    };
-    let x = ci.ptScreenPos.x - hot.0;
-    let y = ci.ptScreenPos.y - hot.1;
-    if let Ok(surface) = bgra.cast::<IDXGISurface1>() {
-        if let Ok(hdc) = surface.GetDC(false) {
-            let _ = DrawIconEx(hdc, x, y, HICON(hcur.0), 0, 0, 0, None, DI_NORMAL);
-            let _ = surface.ReleaseDC(None);
-        }
-    }
-}
+// (Old GDI cursor compositing path -- `cursor_hotspot` + `draw_cursor` --
+// removed in favour of `dda_capture::cursor::composite_cursor_into_bgra`.
+// The GDI path used `IDXGISurface1::GetDC` on a `MISC_GDI_COMPATIBLE`
+// texture, which was a CPU<->GPU sync barrier that queued behind DWM
+// composition work and capped the capture loop's throughput hard whenever
+// DWM was awake. The new path uses DDA's own `PointerPosition` +
+// `GetFramePointerShape` and composites in software during a staging-
+// texture map, no GPU sync barrier. See `CURSOR_GDI_HIDDEN_BOTTLENECK.md`
+// in the zentape root for the full diagnosis.)
 
 fn main() -> Result<()> {
     let args = parse_args();
@@ -602,11 +564,35 @@ fn main() -> Result<()> {
             Usage: D3D11_USAGE_DEFAULT,
             BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
             CPUAccessFlags: 0,
-            MiscFlags: if args.cursor { D3D11_RESOURCE_MISC_GDI_COMPATIBLE.0 as u32 } else { 0 },
+            // No `MISC_GDI_COMPATIBLE`: we don't use `GetDC` anymore. The flag
+            // forced a slower CPU-mappable linear layout on every Map call;
+            // dropping it is a free win even when cursor=false.
+            MiscFlags: 0,
         };
         let mut bgra: Option<ID3D11Texture2D> = None;
         device.CreateTexture2D(&bgra_desc, None, Some(&mut bgra))?;
         let bgra = bgra.unwrap();
+
+        // BGRA staging used as the read-modify-write scratch space for
+        // software cursor compositing. Only created when --cursor is on
+        // because the staging copy + readback + writeback costs ~2-3 ms /
+        // frame and is wasted otherwise.
+        let bgra_stage: Option<ID3D11Texture2D> = if args.cursor {
+            let bgra_stage_desc = D3D11_TEXTURE2D_DESC {
+                Width: src_w, Height: src_h, MipLevels: 1, ArraySize: 1,
+                Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Usage: D3D11_USAGE_STAGING, BindFlags: 0,
+                CPUAccessFlags: (D3D11_CPU_ACCESS_READ.0 | D3D11_CPU_ACCESS_WRITE.0) as u32,
+                MiscFlags: 0,
+            };
+            let mut s: Option<ID3D11Texture2D> = None;
+            device.CreateTexture2D(&bgra_stage_desc, None, Some(&mut s))?;
+            s
+        } else {
+            None
+        };
+
         let dda_path = build_vp(&vdev, &bgra, src_w, src_h, &nv12, dst_w, dst_h)?;
 
         // --- HOOK setup (lazy: wait for the SHM/shared texture to appear) ---
@@ -660,7 +646,10 @@ fn main() -> Result<()> {
         let mut next_emit_t = 0.0f64; // wall-clock time of the next output slot
         let mut started = false;
         let mut done = false;
-        let mut cursor_cache: (usize, (i32, i32)) = (0, (0, 0)); // hcursor -> hotspot
+        // Cached cursor state (position, shape) refreshed each AcquireNextFrame
+        // from DDA's PointerPosition + GetFramePointerShape. Initial state is
+        // all-zeros / not-visible; first frame seeds it.
+        let mut cursor_state = CursorState::default();
 
         loop {
             if args.secs > 0.0 && start.elapsed().as_secs_f64() >= args.secs {
@@ -773,9 +762,70 @@ fn main() -> Result<()> {
                                 context.CopyResource(&bgra, &frame_tex);
                             }
                         }
-                        let _ = dup.ReleaseFrame();
+                        // Cursor pos + shape are reported on the frame_info we
+                        // already have; refresh the cache before releasing.
                         if args.cursor {
-                            draw_cursor(&bgra, &mut cursor_cache); // OS cursor onto BGRA
+                            let _ = cursor_state.update_from_frame(
+                                &dup,
+                                fi.LastMouseUpdateTime,
+                                &fi.PointerPosition,
+                                fi.PointerShapeBufferSize,
+                            );
+                        }
+                        let _ = dup.ReleaseFrame();
+                        // Software cursor composite -- but ONLY the cursor's
+                        // bounding box, not the whole frame. zentape must copy the
+                        // composited frame back to the GPU for the NV12 pass, so a
+                        // full-frame staging round-trip (~8 MB x2 + memcpy) roughly
+                        // halves capture rate at 1080p. Round-tripping just the
+                        // ~32-128px cursor rect makes it ~free. (rustcam doesn't hit
+                        // this since it hands the CPU frame straight to Python.)
+                        if let (true, Some(stage), Some(shape)) =
+                            (args.cursor, bgra_stage.as_ref(), cursor_state.shape.as_ref())
+                        {
+                            if cursor_state.visible {
+                                // Clamp the cursor rect to the frame.
+                                let l = cursor_state.pos_x.max(0);
+                                let t = cursor_state.pos_y.max(0);
+                                let r = (cursor_state.pos_x + shape.width as i32).min(src_w as i32);
+                                let b = (cursor_state.pos_y + shape.height as i32).min(src_h as i32);
+                                if r > l && b > t {
+                                    let (bw, bh) = ((r - l) as usize, (b - t) as usize);
+                                    let src_box = D3D11_BOX {
+                                        left: l as u32, top: t as u32, front: 0,
+                                        right: r as u32, bottom: b as u32, back: 1,
+                                    };
+                                    // Copy just the cursor rect into stage's (0,0).
+                                    context.CopySubresourceRegion(
+                                        stage, 0, 0, 0, 0, &bgra, 0, Some(&src_box));
+                                    let mut m = D3D11_MAPPED_SUBRESOURCE::default();
+                                    if context.Map(stage, 0, D3D11_MAP_READ_WRITE, 0, Some(&mut m)).is_ok() {
+                                        let pitch = m.RowPitch as usize;
+                                        let mut buf = vec![0u8; bw * bh * 4];
+                                        for y in 0..bh {
+                                            std::ptr::copy_nonoverlapping(
+                                                (m.pData as *const u8).add(y * pitch),
+                                                buf.as_mut_ptr().add(y * bw * 4), bw * 4);
+                                        }
+                                        // origin = rect top-left, so the compositor
+                                        // places the cursor at (pos - origin) in buf.
+                                        composite_cursor_into_bgra(
+                                            &mut buf, bw as u32, bh as u32, l, t, &cursor_state);
+                                        for y in 0..bh {
+                                            std::ptr::copy_nonoverlapping(
+                                                buf.as_ptr().add(y * bw * 4),
+                                                (m.pData as *mut u8).add(y * pitch), bw * 4);
+                                        }
+                                        context.Unmap(stage, 0);
+                                        let stage_box = D3D11_BOX {
+                                            left: 0, top: 0, front: 0,
+                                            right: bw as u32, bottom: bh as u32, back: 1,
+                                        };
+                                        context.CopySubresourceRegion(
+                                            &bgra, 0, l as u32, t as u32, 0, stage, 0, Some(&stage_box));
+                                    }
+                                }
+                            }
                         }
                         vp_blt(&vctx, &dda_path)?;
                         nv12_valid = true;
